@@ -5,6 +5,9 @@ from keras.models import load_model
 from keras.preprocessing.image import img_to_array, load_img
 from pathlib import Path
 import numpy as np
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.layers import Dense, Dropout, Flatten, Input
+from tensorflow.keras.models import Sequential
 
 app = Flask(__name__)
 
@@ -27,8 +30,37 @@ model = None
 try:
     model = load_model(str(model_path), compile=False)
 except Exception as e:
-    # Keep the server running so the UI can show a useful error message.
-    MODEL_LOAD_ERROR = str(e)
+    # Fallback: recreate notebook architecture and load weights from H5.
+    try:
+        IMAGE_SIZE = 128
+
+        base_model = VGG16(
+            input_shape=(IMAGE_SIZE, IMAGE_SIZE, 3),
+            include_top=False,
+            weights="imagenet",
+        )
+        for layer in base_model.layers:
+            layer.trainable = False
+        for layer in base_model.layers[-4:]:
+            layer.trainable = True
+
+        model = Sequential()
+        model.add(Input(shape=(IMAGE_SIZE, IMAGE_SIZE, 3)))
+        model.add(base_model)
+        model.add(Flatten())
+        model.add(Dense(256, activation="relu"))
+        model.add(Dropout(0.4))
+        model.add(Dense(128, activation="relu"))
+        model.add(Dropout(0.3))
+        model.add(Dense(4, activation="softmax"))
+
+        if model_path.suffix.lower() in {".h5", ".hdf5"}:
+            model.load_weights(str(model_path))
+        else:
+            raise e
+    except Exception as e2:
+        # Keep the server running so the UI can show a useful error message.
+        MODEL_LOAD_ERROR = f"{e}\n\nFallback load_weights() also failed: {e2}"
 
 # IMPORTANT: This order must match the model's training label order.
 # The frontend expects these exact keys.
