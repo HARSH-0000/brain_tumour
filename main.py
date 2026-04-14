@@ -1,154 +1,63 @@
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, render_template, request, send_from_directory
+from tensorflow.keras.models import load_model
+from keras.preprocessing.image import load_img, img_to_array
+import numpy as np
 import os
 
-from keras.models import load_model
-from keras.preprocessing.image import img_to_array, load_img
-from pathlib import Path
-import numpy as np
-from tensorflow.keras.applications import VGG16
-from tensorflow.keras.layers import Dense, Dropout, Flatten, Input
-from tensorflow.keras.models import Sequential
 
 app = Flask(__name__)
 
-HERE = Path(__file__).resolve().parent
-MODEL_CANDIDATES = [
-    HERE / "model.keras",
-    HERE / "model.h5",
-    HERE / "models" / "model.h5",
-]
+# Load the trained model
+model = load_model('models/model.h5')
 
-model_path = next((p for p in MODEL_CANDIDATES if p.exists()), None)
-if model_path is None:
-    raise FileNotFoundError(
-        "Could not find model.h5. Looked in: "
-        + ", ".join(str(p) for p in MODEL_CANDIDATES)
-    )
 
-MODEL_LOAD_ERROR = None
-model = None
-try:
-    model = load_model(str(model_path), compile=False)
-except Exception as e:
-    # Fallback: recreate notebook architecture and load weights from H5.
-    try:
-        IMAGE_SIZE = 128
+class_labels = ['pituitary', 'glioma', 'notumor', 'meningioma']
 
-        base_model = VGG16(
-            input_shape=(IMAGE_SIZE, IMAGE_SIZE, 3),
-            include_top=False,
-            weights="imagenet",
-        )
-        for layer in base_model.layers:
-            layer.trainable = False
-        for layer in base_model.layers[-4:]:
-            layer.trainable = True
+UPLOAD_FOLDER = './uploads'
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
 
-        model = Sequential()
-        model.add(Input(shape=(IMAGE_SIZE, IMAGE_SIZE, 3)))
-        model.add(base_model)
-        model.add(Flatten())
-        model.add(Dense(256, activation="relu"))
-        model.add(Dropout(0.4))
-        model.add(Dense(128, activation="relu"))
-        model.add(Dropout(0.3))
-        model.add(Dense(4, activation="softmax"))
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-        if model_path.suffix.lower() in {".h5", ".hdf5"}:
-            model.load_weights(str(model_path))
-        else:
-            raise e
-    except Exception as e2:
-        # Keep the server running so the UI can show a useful error message.
-        MODEL_LOAD_ERROR = f"{e}\n\nFallback load_weights() also failed: {e2}"
+# Helper function to predict tumor type
+def predict_tumor(image_path):
+    IMAGE_SIZE = 128
+    img = load_img(image_path, target_size=(IMAGE_SIZE, IMAGE_SIZE))
+    img_array = img_to_array(img) / 255.0  # Normalize pixel values
+    img_array = np.expand_dims(img_array, axis=0)  # Add batch dimension
 
-# IMPORTANT: This order must match the model's training label order.
-# The frontend expects these exact keys.
-CLASS_LABELS = ["pituitary", "glioma", "meningioma", "notumor"]
+    predictions = model.predict(img_array)
+    predicted_class_index = np.argmax(predictions, axis=1)[0]
+    confidence_score = np.max(predictions, axis=1)[0]
 
-LABEL_UI = {
-    "notumor": {
-        "label": "No Tumor Detected",
-        "description": "No tumor patterns detected in the uploaded scan. If symptoms persist, consult a radiologist for confirmation.",
-    },
-    "glioma": {
-        "label": "Glioma",
-        "description": "Model indicates features consistent with glioma. Please consult a specialist; further imaging and clinical correlation are recommended.",
-    },
-    "meningioma": {
-        "label": "Meningioma",
-        "description": "Model indicates features consistent with meningioma. A radiologist's review is recommended for confirmation and treatment planning.",
-    },
-    "pituitary": {
-        "label": "Pituitary Tumor",
-        "description": "Model indicates features consistent with a pituitary tumor. Consider endocrinology and radiology evaluation for next steps.",
-    },
-}
+    if class_labels[predicted_class_index] == 'notumor':
+        return "No Tumor", confidence_score
+    else:
+        return f"Tumor: {class_labels[predicted_class_index]}", confidence_score
 
-upload_folder = str(HERE / "uploads")
-if not os.path.exists(upload_folder):
-    os.makedirs(upload_folder)
-
-def predict(image_path: str):
-    if model is None:
-        raise RuntimeError(
-            "Model failed to load. "
-            "If you trained with a different Keras/TensorFlow version, "
-            "re-export the model in the current environment (preferred: .keras format). "
-            f"Loader error: {MODEL_LOAD_ERROR}"
-        )
-    img_pil = load_img(image_path, target_size=(128, 128))
-    img_array = img_to_array(img_pil)
-    img_normalized = img_array / 255.0
-    img_for_prediction = np.expand_dims(img_normalized, axis=0)
-
-    predictions = model.predict(img_for_prediction, verbose=0)
-    probs = predictions[0].astype(float)
-
-    if probs.shape[0] != len(CLASS_LABELS):
-        raise ValueError(
-            f"Model output has {probs.shape[0]} classes, expected {len(CLASS_LABELS)}."
-        )
-
-    predicted_idx = int(np.argmax(probs))
-    predicted_class = CLASS_LABELS[predicted_idx]
-    confidence_pct = float(probs[predicted_idx] * 100.0)
-
-    all_scores = {cls: float(p * 100.0) for cls, p in zip(CLASS_LABELS, probs)}
-    ui = LABEL_UI.get(predicted_class, {"label": predicted_class, "description": ""})
-
-    return {
-        "predicted_class": predicted_class,
-        "confidence": confidence_pct,
-        "label": ui["label"],
-        "description": ui["description"],
-        "all_scores": all_scores,
-    }
-
-#routes
-@app.route("/",methods=["GET","POST"])
+# Route for the main page (index.html)
+@app.route('/', methods=['GET', 'POST'])
 def index():
-    return render_template("index.html")
+    if request.method == 'POST':
+        # Handle file upload
+        file = request.files['file']
+        if file:
+            # Save the file
+            file_location = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+            file.save(file_location)
 
-@app.route("/predict", methods=["POST"])
-def predict_route():
-    file = request.files.get("image") or request.files.get("file")
-    if not file:
-        return jsonify({"error": "Missing file. Upload with form field 'image' (or 'file')."}), 400
+            # Predict the tumor
+            result, confidence = predict_tumor(file_location)
 
-    filename = os.path.join(upload_folder, file.filename)
-    file.save(filename)
+            # Return result along with image path for display
+            return render_template('index.html', result=result, confidence=f"{confidence*100:.2f}%", file_path=f'/uploads/{file.filename}')
 
-    try:
-        result = predict(filename)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        try:
-            os.remove(filename)
-        except OSError:
-            pass
+    return render_template('index.html', result=None)
 
-if __name__=="__main__":
-    app.run(host="0.0.0.0",debug=True)
+# Route to serve uploaded files
+@app.route('/uploads/<filename>')
+def get_uploaded_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+if __name__ == '__main__':
+    app.run(debug=True)
